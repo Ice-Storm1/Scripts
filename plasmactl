@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+import sys, os
+
+sys.dont_write_bytecode = True
+
+if not sys.stderr.isatty():
+    os.system(f'konsole --hold -e {sys.argv[0]}')
+    sys.exit()
+
+import shutil, subprocess, signal, re, tempfile, time
+from datetime import date
+from pathlib import Path
+
+RED = '\033[0;31m'
+GREEN = '\033[0;32m'
+YELLOW = '\033[1;33m'
+CYAN = '\033[94m'
+WHITE = '\033[1;37m'
+BOLD = '\033[1m'
+NC = '\033[0m'
+SEP = "  ────────────────────────────────────────────"
+
+OK = f"{GREEN}[ OK ]{NC}"
+ERR = f"{RED}[ERR]{NC}"
+WARN = f"{YELLOW}[WARN]{NC}"
+INFO = f"{CYAN}[INFO]{NC}"
+PROC = f"{WHITE}[ .. ]{NC}"
+
+HOME = Path.home()
+try:
+    SCRIPT_DIR = Path(os.path.realpath(__file__)).parent
+except Exception:
+    SCRIPT_DIR = HOME / "Scrivania"
+BACKUP_PREFIX = "plsctlconfig"
+
+THEME_DIRS = [
+    HOME / ".local/share/plasma/desktoptheme",
+    HOME / ".local/share/plasma/look-and-feel",
+    HOME / ".local/share/plasma/plasmoids",
+    HOME / ".local/share/plasma/splash",
+    HOME / ".local/share/aurorae/themes",
+    HOME / ".local/share/color-schemes",
+    HOME / ".local/share/icons",
+    HOME / ".local/share/themes",
+    HOME / ".local/share/wallpapers",
+    HOME / ".local/share/kwin/scripts",
+]
+
+CONFIG_FILES = [
+    HOME / ".config/plasma-org.kde.plasma.desktop-appletsrc",
+    HOME / ".config/plasmashellrc",
+    HOME / ".config/plasmarc",
+    HOME / ".config/kwinrc",
+    HOME / ".config/kdeglobals",
+    HOME / ".config/kded6rc",
+    HOME / ".config/breezerc",
+    HOME / ".config/ksplashrc",
+    HOME / ".config/kscreenlockerrc",
+    HOME / ".config/gtk-3.0/settings.ini",
+    HOME / ".config/gtk-4.0/settings.ini",
+]
+
+KEEP_DESKTHEME = re.compile(r'^(breeze|breeze-dark|breeze-light|fedora|fedora-dark|fedora-light)$')
+KEEP_COLORS = re.compile(r'^Breeze')
+KEEP_ICONS = re.compile(r'^(hicolor|breeze|breeze-dark|breeze-light|distrobox)$')
+KEEP_AURORAE = re.compile(r'^(Breeze|Breeze-light|Breeze-dark)$')
+
+CAT_NAMES = [
+    "stili plasma", "look-and-feel", "widget", "schermata iniziale",
+    "decorazioni finestre", "schemi colore", "icone",
+    "temi gtk", "sfondi", "script kwin", "layout e configurazione"
+]
+CAT_RELS = [
+    ".local/share/plasma/desktoptheme",
+    ".local/share/plasma/look-and-feel",
+    ".local/share/plasma/plasmoids",
+    ".local/share/plasma/splash",
+    ".local/share/aurorae/themes",
+    ".local/share/color-schemes",
+    ".local/share/icons",
+    ".local/share/themes",
+    ".local/share/wallpapers",
+    ".local/share/kwin/scripts",
+    ".config",
+]
+CAT_COUNT = len(CAT_NAMES)
+
+
+def signal_handler(sig, frame):
+    print()
+    subprocess.run(['kstart5', 'plasmashell'], stderr=subprocess.DEVNULL)
+    sys.exit(1)
+
+
+def check_prereqs():
+    missing = 0
+    for cmd in ('kwriteconfig6', 'kquitapp5', 'kstart5',
+                'plasma-apply-lookandfeel', 'plasma-apply-desktoptheme',
+                'plasma-apply-colorscheme', 'plasma-apply-icons'):
+        if not shutil.which(cmd):
+            print(f"  {WARN} {cmd} non trovato")
+            missing += 1
+    if missing:
+        print()
+
+
+def header():
+    os.system('clear')
+    print()
+    print(f"  {BOLD}plasmactl{NC} — gestore temi KDE Plasma")
+    print(SEP)
+
+
+def pause():
+    print()
+    print(f"  {INFO} invio per continuare...")
+    input()
+
+
+def confirm(msg):
+    print()
+    ans = input(f"  {msg} [y/N]: ")
+    return ans.lower() in ('y', 's')
+
+
+def get_display_name(d):
+    name = d.name.replace(f"{BACKUP_PREFIX}-", "", 1)
+    meta = d / ".meta" / "name"
+    if meta.is_file():
+        name = meta.read_text().strip()
+    return name
+
+
+def pick_backup():
+    dirs = sorted([d for d in SCRIPT_DIR.glob(f"{BACKUP_PREFIX}-*") if d.is_dir()])
+
+    if not dirs:
+        print(f"  {ERR} nessun backup trovato in {SCRIPT_DIR}")
+        print(f"  {INFO} creane uno con: backup")
+        pause()
+        return None
+
+    if len(dirs) == 1:
+        name = get_display_name(dirs[0])
+        print(f"  {OK} backup: {name}")
+        return dirs[0], name
+
+    print(f"  {INFO} backup disponibili:")
+    print()
+    for i, d in enumerate(dirs):
+        display = get_display_name(d)
+        print(f"  {i+1:2d}  {display}")
+    print()
+    choice = input("  scegli [1]: ").strip()
+    choice = int(choice) if choice.isdigit() else 1
+    idx = choice - 1
+    if idx < 0 or idx >= len(dirs):
+        print(f"  {ERR} numero non valido")
+        pause()
+        return None
+    name = get_display_name(dirs[idx])
+    return dirs[idx], name
+
+
+def extract_colors(src, dst):
+    in_colors = False
+    try:
+        with open(src, 'r') as fin, open(dst, 'w') as fout:
+            for line in fin:
+                if re.match(r'^\[Colors:', line):
+                    in_colors = True
+                    fout.write(line)
+                    continue
+                if in_colors:
+                    if line.startswith('['):
+                        in_colors = False
+                    else:
+                        fout.write(line)
+    except FileNotFoundError:
+        pass
+
+
+def merge_colors(kdeglobals, colors_values):
+    try:
+        tmp = tempfile.NamedTemporaryFile(mode='w', delete=False)
+        tmp_name = tmp.name
+        in_colors = False
+        with open(kdeglobals, 'r') as f:
+            for line in f:
+                if re.match(r'^\[Colors:', line):
+                    in_colors = True
+                    continue
+                if in_colors and line.startswith('['):
+                    in_colors = False
+                if not in_colors:
+                    tmp.write(line)
+        with open(colors_values, 'r') as cv:
+            tmp.write(cv.read())
+        tmp.close()
+        shutil.move(tmp_name, kdeglobals)
+    except FileNotFoundError:
+        try:
+            Path(tmp_name).unlink()
+        except Exception:
+            pass
+
+
+# ─── BACKUP ─────────────────────────────────────────────
+
+def backup():
+    header()
+    print()
+
+    has = False
+    for d in THEME_DIRS:
+        if d.is_dir() and any(d.iterdir()):
+            has = True
+            break
+    if not has:
+        for f in CONFIG_FILES:
+            if f.is_file():
+                has = True
+                break
+    if not has:
+        print(f"  {WARN} nessun tema o configurazione da salvare")
+        pause()
+        return
+
+    default_name = f"backup-{date.today().isoformat()}"
+    raw = input(f"  nome del backup [{default_name}]: ").strip()
+    input_name = raw or default_name
+    input_name = re.sub(r'[^a-zA-Z0-9_-]', '', input_name)
+    if not input_name:
+        input_name = default_name
+
+    dir_name = f"{BACKUP_PREFIX}-{input_name}"
+    backup_dir = SCRIPT_DIR / dir_name
+
+    if backup_dir.is_dir():
+        print(f"  {WARN} \"{input_name}\" esiste già")
+        if not confirm("sovrascrivere"):
+            return
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+    meta_dir = backup_dir / ".meta"
+    config_dir = backup_dir / ".config"
+    meta_dir.mkdir(parents=True)
+    config_dir.mkdir(exist_ok=True)
+    (meta_dir / "name").write_text(input_name)
+
+    print()
+    print(f"  {PROC} salvataggio cartelle temi...")
+    tot = 0
+    for d in THEME_DIRS:
+        if not d.is_dir():
+            continue
+        rel = str(d.relative_to(HOME))
+        dest = backup_dir / rel
+        dest.mkdir(parents=True, exist_ok=True)
+        c = 0
+        for item in d.iterdir():
+            try:
+                if item.is_dir():
+                    shutil.copytree(item, dest / item.name, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, dest / item.name)
+                c += 1
+            except OSError:
+                pass
+        if c:
+            print(f"  {d.name:<30} {c} elementi")
+        tot += c
+
+    print()
+    print(f"  {PROC} salvataggio configurazione...")
+    cfg = 0
+    for f in CONFIG_FILES:
+        if f.is_file():
+            shutil.copy2(f, config_dir / f.name)
+            cfg += 1
+    print(f"  {'configurazione':<30} {cfg} file")
+
+    print()
+    print(f"  {PROC} estrazione metadati...")
+    kdeglobals = HOME / ".config" / "kdeglobals"
+
+    try:
+        with open(kdeglobals, 'r') as f:
+            content = f.read()
+    except FileNotFoundError:
+        content = ""
+
+    lnf = ""
+    m = re.search(r'^LookAndFeelPackage=(.+)', content, re.M)
+    if m:
+        lnf = m.group(1).strip()
+        (meta_dir / "lookandfeel").write_text(lnf)
+        print(f"  {'look-and-feel':<30} {lnf}")
+
+    dt = ""
+    plasmarc = HOME / ".config" / "plasmarc"
+    if plasmarc.is_file():
+        m = re.search(r'^name=(.+)', plasmarc.read_text(), re.M)
+        if m:
+            dt = m.group(1).strip()
+            (meta_dir / "desktoptheme").write_text(dt)
+            print(f"  {'tema plasma':<30} {dt}")
+
+    cs = ""
+    m = re.search(r'^ColorScheme=(.+)', content, re.M)
+    if m:
+        cs = m.group(1).strip()
+        (meta_dir / "colorscheme").write_text(cs)
+        print(f"  {'schema colore':<30} {cs}")
+
+    ic = ""
+    m = re.search(r'^Theme=(.+)', content, re.M)
+    if m:
+        ic = m.group(1).strip()
+        (meta_dir / "icons").write_text(ic)
+        print(f"  {'icone':<30} {ic}")
+
+    dc = ""
+    kwinrc = HOME / ".config" / "kwinrc"
+    if kwinrc.is_file():
+        m = re.search(r'^theme=(.+)', kwinrc.read_text(), re.M)
+        if m:
+            dc = m.group(1).strip()
+            (meta_dir / "decoration").write_text(dc)
+            print(f"  {'decorazione':<30} {dc}")
+
+    colors_values = meta_dir / "colors_values"
+    extract_colors(kdeglobals, colors_values)
+    if colors_values.is_file() and colors_values.stat().st_size:
+        print(f"  {'colori custom':<30} salvati")
+    else:
+        try:
+            colors_values.unlink()
+        except FileNotFoundError:
+            pass
+
+    print()
+    print(SEP)
+    print(f"  {OK} backup completato")
+    print(f"  {'destinazione':<30} {backup_dir}")
+    print(f"  {'totale':<30} {tot} elementi, {cfg} file config")
+    print(SEP)
+    pause()
+
+
+# ─── RESET ──────────────────────────────────────────────
+
+def reset():
+    header()
+    print()
+    print(SEP)
+    print()
+    print(f"  {WARN} verranno eliminate tutte le configurazioni KDE")
+    print()
+    if not confirm("procedere"):
+        return
+
+    print()
+    print(f"  {PROC} pulizia temi e componenti...")
+    tot = 0
+    for d in THEME_DIRS:
+        if not d.is_dir():
+            continue
+        for item in d.iterdir():
+            name = item.name
+            keep = False
+            if d.name == "desktoptheme" and KEEP_DESKTHEME.match(name):
+                keep = True
+            elif d.name == "color-schemes" and KEEP_COLORS.match(name):
+                keep = True
+            elif d.name == "icons" and KEEP_ICONS.match(name):
+                keep = True
+            elif d.name == "themes" and d.parent.name == "aurorae" and KEEP_AURORAE.match(name):
+                keep = True
+            if keep:
+                continue
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink()
+                tot += 1
+            except OSError:
+                pass
+    print(f"  {'temi e componenti':<30} {tot} elementi rimossi")
+
+    print()
+    print(f"  {PROC} rimozione file di configurazione...")
+    cfg = 0
+    for f in CONFIG_FILES:
+        if f.is_file():
+            try:
+                f.unlink()
+                cfg += 1
+            except OSError:
+                pass
+    print(f"  {'configurazione':<30} {cfg} file eliminati")
+
+    print()
+    print(f"  {PROC} applicazione tema breeze...")
+    if shutil.which('plasma-apply-lookandfeel'):
+        subprocess.run(['plasma-apply-lookandfeel', '-a', 'org.kde.breeze.desktop'],
+                       stderr=subprocess.DEVNULL)
+        print(f"  {'tema applicato':<30} Breeze")
+    elif shutil.which('kwriteconfig6'):
+        subprocess.run(['kwriteconfig6', '--file', str(HOME / ".config/plasmarc"),
+                        '--group', 'Theme', '--key', 'name', 'default'],
+                       stderr=subprocess.DEVNULL)
+        subprocess.run(['kwriteconfig6', '--file', str(HOME / ".config/kdeglobals"),
+                        '--group', 'General', '--key', 'ColorScheme', 'Breeze'],
+                       stderr=subprocess.DEVNULL)
+        subprocess.run(['kwriteconfig6', '--file', str(HOME / ".config/kdeglobals"),
+                        '--group', 'Icons', '--key', 'Theme', 'breeze'],
+                       stderr=subprocess.DEVNULL)
+        print(f"  {'tema applicato':<30} Breeze (fallback)")
+    else:
+        print(f"  {WARN} impossibile applicare breeze")
+
+    print()
+    print(SEP)
+    print(f"  {OK} reset completato")
+    print(SEP)
+
+    print()
+    print(f"  {PROC} riavvio shell plasma...")
+    subprocess.run(['kquitapp5', 'plasmashell'], stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    subprocess.Popen(['kstart5', 'plasmashell'], stderr=subprocess.DEVNULL)
+    pause()
+
+
+# ─── RESTORE ────────────────────────────────────────────
+
+def restore():
+    header()
+    print()
+    result = pick_backup()
+    if not result:
+        return
+    backup_dir, backup_name = result
+    print()
+
+    selected = {}
+    mantieni = 0
+    non_mantieni = 0
+
+    print("  y = mantieni tema (ripristina dal backup)")
+    print("  N = non mantenere (reset a Breeze o default)")
+    print("  a = tieni tutto")
+    print("  o = resetta tutto")
+    print()
+    global_choice = input("  >> (invio = chiedi singolarmente): ").strip()
+
+    if global_choice.lower() == 'a':
+        for i in range(CAT_COUNT):
+            selected[i] = True
+        mantieni = CAT_COUNT
+    elif global_choice.lower() == 'o':
+        for i in range(CAT_COUNT):
+            selected[i] = False
+        non_mantieni = CAT_COUNT
+    else:
+        for i in range(CAT_COUNT):
+            ans = input(f"  {i+1:2d}  {CAT_NAMES[i]:<25} [y/N]: ").strip()
+            if ans.lower() in ('y', 's'):
+                selected[i] = True
+                mantieni += 1
+            else:
+                selected[i] = False
+                non_mantieni += 1
+
+    os.system('clear')
+    print()
+    print(f"  {BOLD}RIEPILOGO{NC}")
+    print(SEP)
+    print(f"  {'backup':<30} {backup_name}")
+    print()
+    for i in range(CAT_COUNT):
+        status = "→ mantieni" if selected[i] else "→ non mantenere"
+        print(f"  {i+1:2d}  {CAT_NAMES[i]:<25} {status}")
+    print(SEP)
+    print(f"  {mantieni} mantenuti, {non_mantieni} non mantenuti")
+    print(SEP)
+    if not confirm("avviare il restore"):
+        return
+
+    step = 0
+    mantieni_r = 0
+    default_r = 0
+    vuoti = 0
+    recap_ris = [""] * CAT_COUNT
+
+    os.system('clear')
+    print()
+    print(f"  {BOLD}RESTORE IN CORSO{NC}")
+    print(SEP)
+    print()
+
+    for i in range(CAT_COUNT):
+        rel = CAT_RELS[i]
+        src = backup_dir / rel
+        dest = HOME / rel
+
+        if rel == ".config":
+            continue
+
+        if selected[i]:
+            if not src.is_dir() or not any(src.iterdir()):
+                recap_ris[i] = "— vuoto"
+                vuoti += 1
+                continue
+            step += 1
+            print(f"  [{step}] {(CAT_NAMES[i] + '...'):<30} ", end='', flush=True)
+            dest.mkdir(parents=True, exist_ok=True)
+            c = 0
+            for item in src.iterdir():
+                try:
+                    if item.is_dir():
+                        shutil.copytree(item, dest / item.name, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(item, dest / item.name)
+                    c += 1
+                except OSError:
+                    pass
+            recap_ris[i] = f"{c} elementi"
+            print(f"\r  [{step}] {CAT_NAMES[i]:<30} {OK} {c} elementi")
+            mantieni_r += 1
+        else:
+            step += 1
+            print(f"  [{step}] {(CAT_NAMES[i] + '...'):<30} ", end='', flush=True)
+            removed = 0
+            if dest.is_dir():
+                for item in dest.iterdir():
+                    name = item.name
+                    keep = False
+                    if rel == ".local/share/plasma/desktoptheme":
+                        keep = bool(KEEP_DESKTHEME.match(name))
+                    elif rel in (".local/share/plasma/look-and-feel",
+                                 ".local/share/plasma/plasmoids",
+                                 ".local/share/plasma/splash"):
+                        keep = False
+                    elif rel == ".local/share/aurorae/themes":
+                        keep = bool(KEEP_AURORAE.match(name))
+                    elif rel == ".local/share/color-schemes":
+                        keep = bool(KEEP_COLORS.match(name))
+                    elif rel == ".local/share/icons":
+                        keep = bool(KEEP_ICONS.match(name))
+                    elif rel in (".local/share/themes",
+                                 ".local/share/wallpapers",
+                                 ".local/share/kwin/scripts"):
+                        keep = False
+                    if keep:
+                        continue
+                    try:
+                        if item.is_dir():
+                            shutil.rmtree(item, ignore_errors=True)
+                        else:
+                            item.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+            recap_ris[i] = f"reset ({removed} rimossi)"
+            print(f"\r  [{step}] {CAT_NAMES[i]:<30} {OK} reset ({removed} rimossi)")
+            default_r += 1
+
+    print()
+    print(f"  {PROC} arresto shell plasma...")
+    subprocess.run(['kquitapp5', 'plasmashell'], stderr=subprocess.DEVNULL)
+    time.sleep(2)
+    subprocess.run(['killall', '-9', 'plasmashell'], stderr=subprocess.DEVNULL)
+    time.sleep(1)
+
+    print()
+    print(f"  {PROC} configurazione...")
+
+    config_idx = 10
+    if selected[config_idx]:
+        config_src = backup_dir / ".config"
+        if config_src.is_dir() and any(config_src.iterdir()):
+            c = 0
+            for f in config_src.iterdir():
+                if f.is_file():
+                    try:
+                        shutil.copy2(f, HOME / ".config" / f.name)
+                        c += 1
+                    except OSError:
+                        pass
+            recap_ris[config_idx] = f"{c} file"
+            print(f"  {'layout e configurazione':<30} {OK} {c} file")
+            mantieni_r += 1
+        else:
+            recap_ris[config_idx] = "— vuoto"
+            vuoti += 1
+    else:
+        c = 0
+        for f in CONFIG_FILES:
+            if f.is_file():
+                try:
+                    f.unlink()
+                    c += 1
+                except OSError:
+                    pass
+        recap_ris[config_idx] = f"reset ({c} eliminati)"
+        print(f"  {'layout e configurazione':<30} {OK} reset ({c} eliminati)")
+        default_r += 1
+
+    print()
+    print(f"  {PROC} applicazione temi...")
+
+    meta = backup_dir / ".meta"
+
+    # stili plasma (0)
+    if selected[0]:
+        style = ""
+        dt_file = meta / "desktoptheme"
+        if dt_file.is_file():
+            style = dt_file.read_text().strip()
+        if not style:
+            lnf_file = meta / "lookandfeel"
+            if lnf_file.is_file():
+                ls = lnf_file.read_text().strip()
+                mapping = {
+                    'breezedark.desktop': 'breeze-dark',
+                    'breezetwilight.desktop': 'breeze-light',
+                    'breeze.desktop': 'default',
+                    'fedoradark.desktop': 'breeze-dark',
+                    'fedora.desktop': 'default',
+                    'fedoralight.desktop': 'breeze-light',
+                }
+                for key, val in mapping.items():
+                    if key in ls:
+                        style = val
+                        break
+        if not style:
+            style = "default"
+        if shutil.which('plasma-apply-desktoptheme'):
+            subprocess.run(['plasma-apply-desktoptheme', style], stderr=subprocess.DEVNULL)
+        print(f"  {'stili plasma':<30} {style}")
+    else:
+        if shutil.which('plasma-apply-desktoptheme'):
+            subprocess.run(['plasma-apply-desktoptheme', 'default'], stderr=subprocess.DEVNULL)
+        print(f"  {'stili plasma':<30} Breeze")
+
+    # look-and-feel (1)
+    if selected[1]:
+        lf_file = meta / "lookandfeel"
+        if lf_file.is_file() and shutil.which('plasma-apply-lookandfeel'):
+            lf = lf_file.read_text().strip()
+            subprocess.run(['plasma-apply-lookandfeel', '-a', lf], stderr=subprocess.DEVNULL)
+            print(f"  {'look-and-feel':<30} {lf}")
+        else:
+            print(f"  {WARN} {'look-and-feel':<30} — vuoto")
+    else:
+        if shutil.which('plasma-apply-lookandfeel'):
+            subprocess.run(['plasma-apply-lookandfeel', '-a', 'org.kde.breeze.desktop'],
+                           stderr=subprocess.DEVNULL)
+        print(f"  {'look-and-feel':<30} Breeze")
+
+    # decorazioni finestre (4)
+    if selected[4]:
+        dc_file = meta / "decoration"
+        if dc_file.is_file():
+            dc = dc_file.read_text().strip()
+            if (HOME / ".local/share/aurorae/themes" / dc).is_dir():
+                subprocess.run(['kwriteconfig6', '--file', str(HOME / ".config/kwinrc"),
+                                '--group', 'org.kde.kdecoration2', '--key', 'theme', dc],
+                               stderr=subprocess.DEVNULL)
+                print(f"  {'decorazioni finestre':<30} {dc}")
+            else:
+                subprocess.run(['kwriteconfig6', '--file', str(HOME / ".config/kwinrc"),
+                                '--group', 'org.kde.kdecoration2', '--key', 'theme', 'Breeze'],
+                               stderr=subprocess.DEVNULL)
+                print(f"  {'decorazioni finestre':<30} {dc} (non presente)")
+        else:
+            print(f"  {WARN} {'decorazioni finestre':<30} — vuoto")
+    else:
+        subprocess.run(['kwriteconfig6', '--file', str(HOME / ".config/kwinrc"),
+                        '--group', 'org.kde.kdecoration2', '--key', 'theme', 'Breeze'],
+                       stderr=subprocess.DEVNULL)
+        print(f"  {'decorazioni finestre':<30} Breeze")
+
+    # schemi colore (5)
+    if selected[5]:
+        sch = ""
+        cs_file = meta / "colorscheme"
+        if cs_file.is_file():
+            sch = cs_file.read_text().strip()
+        if not sch:
+            lnf_file = meta / "lookandfeel"
+            if lnf_file.is_file():
+                ls = lnf_file.read_text().strip()
+                if 'breezedark.desktop' in ls or 'fedoradark.desktop' in ls:
+                    sch = "BreezeDark"
+                elif 'breezetwilight.desktop' in ls:
+                    sch = "BreezeLight"
+        if not sch:
+            sch = "BreezeClassic"
+        if shutil.which('plasma-apply-colorscheme'):
+            subprocess.run(['plasma-apply-colorscheme', sch], stderr=subprocess.DEVNULL)
+        cst = ""
+        cv_file = meta / "colors_values"
+        if cv_file.is_file() and cv_file.stat().st_size:
+            merge_colors(HOME / ".config/kdeglobals", cv_file)
+            cst = " (con colori custom)"
+        print(f"  {'schemi colore':<30} {sch}{cst}")
+    else:
+        if shutil.which('plasma-apply-colorscheme'):
+            subprocess.run(['plasma-apply-colorscheme', 'BreezeClassic'], stderr=subprocess.DEVNULL)
+        print(f"  {'schemi colore':<30} BreezeClassic")
+
+    # icone (6)
+    if selected[6]:
+        ic_file = meta / "icons"
+        if ic_file.is_file():
+            ic = ic_file.read_text().strip()
+            if shutil.which('plasma-apply-icons'):
+                subprocess.run(['plasma-apply-icons', ic], stderr=subprocess.DEVNULL)
+            print(f"  {'icone':<30} {ic}")
+        else:
+            print(f"  {WARN} {'icone':<30} — vuoto")
+    else:
+        if shutil.which('plasma-apply-icons'):
+            subprocess.run(['plasma-apply-icons', 'breeze'], stderr=subprocess.DEVNULL)
+        print(f"  {'icone':<30} breeze")
+
+    # safety check decorazione
+    kwinrc = HOME / ".config" / "kwinrc"
+    if kwinrc.is_file():
+        m = re.search(r'^theme=(.+)', kwinrc.read_text(), re.M)
+        if m:
+            dc_cur = m.group(1).strip()
+            if dc_cur and not re.match(r'^[Bb]reeze', dc_cur):
+                found = False
+                if (HOME / ".local/share/aurorae/themes" / dc_cur).is_dir():
+                    found = True
+                if (Path("/usr/share/aurorae/themes") / dc_cur).is_dir():
+                    found = True
+                if not found:
+                    subprocess.run(['kwriteconfig6', '--file', str(kwinrc),
+                                    '--group', 'org.kde.kdecoration2', '--key', 'theme', 'Breeze'],
+                                   stderr=subprocess.DEVNULL)
+                    print(f"  {WARN} {'decorazione reset':<30} {dc_cur} → Breeze (non presente)")
+
+    print()
+    print(SEP)
+    print(f"  {OK} restore completato")
+    print()
+    for i in range(CAT_COUNT):
+        ris = recap_ris[i]
+        if not ris:
+            continue
+        print(f"  {i+1:2d}  {CAT_NAMES[i]:<25} {ris}")
+    print()
+    print(f"  {mantieni_r} mantenuti, {default_r} non mantenuti", end='')
+    if vuoti:
+        print(f", {vuoti} vuoti", end='')
+    print()
+    print(SEP)
+
+    print()
+    print(f"  {PROC} riavvio shell plasma...")
+    subprocess.Popen(['kstart5', 'plasmashell'], stderr=subprocess.DEVNULL)
+    pause()
+
+
+# ─── MENU ───────────────────────────────────────────────
+
+def menu():
+    while True:
+        header()
+        print()
+        print(f"  {CYAN}[1]{NC} {'backup':<9} salva temi e configurazione attuali")
+        print(f"  {CYAN}[2]{NC} {'reset':<9} ripristina kde ai default breeze")
+        print(f"  {CYAN}[3]{NC} {'restore':<9} ripristina selettivamente da backup")
+        print()
+        print(f"  {CYAN}[0]{NC} {'exit':<9}")
+        print()
+        choice = input("  >> ").strip()
+
+        if choice in ('backup', '1'):
+            backup()
+        elif choice in ('reset', '2'):
+            reset()
+        elif choice in ('restore', '3'):
+            restore()
+        elif choice in ('exit', '0', 'q'):
+            os.system('clear')
+            print("plasmactl")
+            print("────────────────────────────────────────────")
+            print()
+            break
+        else:
+            print()
+            print(f"  {ERR} comando non valido")
+            time.sleep(1)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    check_prereqs()
+    menu()
