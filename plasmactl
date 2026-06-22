@@ -353,8 +353,6 @@ def backup():
 def reset():
     header()
     print()
-    print(SEP)
-    print()
     print(f"  {WARN} verranno eliminate tutte le configurazioni KDE")
     print()
     if not confirm("procedere"):
